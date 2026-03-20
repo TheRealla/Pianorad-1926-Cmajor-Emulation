@@ -1,0 +1,149 @@
+// Pianorad_Fitch_Edition_With_Chain.cmajor
+// Extended self-contained version with approximate post-chain for Amorph compile
+
+import std::oscillators;
+import std::math;
+import std::midi;
+import std::filters;
+import std::levels;
+import std::noise;
+import std::dynamics;  // for basic compressor if available; fallback to manual
+
+graph Pianorad_Fitch_With_Chain [[main]]
+{
+    input event midi::Message midiIn;
+
+    // Original params...
+    input float tubeAge      [[ name: "Tube Drift", min: 0.0, max: 0.15, init: 0.03 ]];
+    input float voltageSag   [[ name: "B+ Sag", min: 0.0, max: 0.6, init: 0.18 ]];
+    input float drive        [[ name: "Saturation", min: 0.0, max: 2.5, init: 0.9 ]];
+    input float hornCutoff   [[ name: "Horn Cutoff Hz", min: 800.0, max: 9000.0, init: 4200.0 ]];
+    input bool  wrnyMode     [[ name: "WRNY Mode", init: false ]];
+    input float masterGain   [[ name: "Master Vol", min: 0.0, max: 2.0, init: 0.85 ]];
+
+    // New chain params (approximations)
+    input float eqLowBoost   [[ name: "Pultec Low Boost dB", min: -12.0, max: 12.0, init: 3.0 ]];
+    input float eqHighBoost  [[ name: "Pultec Air Boost dB", min: -12.0, max: 12.0, init: 2.0 ]];
+    input float tapeMix      [[ name: "Tape Echo Mix %", min: 0.0, max: 0.5, init: 0.2 ]];
+    input float bandwidth    [[ name: "AM Bandwidth Hz", min: 2000.0, max: 8000.0, init: 5000.0 ]];
+
+    output stream float audioOut[2];
+
+    let maxVoices = 25;
+    node voiceAlloc = SimpleVoiceAllocator (maxVoices);
+    node voices = FitchOscillator[maxVoices];
+    node summer = std::math::Sum (float, maxVoices);
+    node sagMonitor = std::levels::RMS (0.08);
+
+    // Chain processors (built-in approximations)
+    node pultecEq = PultecApproxEq;
+    node tapeSat = TapeSatApprox;
+    node echo = SimpleTapeEcho;
+    node lp = std::filters::tpt::LowPass();
+    node hp = std::filters::tpt::HighPass();
+
+    // Connections...
+    connection midiIn -> voiceAlloc.midiIn;
+    connection voiceAlloc.voiceTriggers -> voices[*].noteTrigger;
+    connection voices[*].audioOut -> summer.inputs[*];
+    connection summer -> sagMonitor.in;
+    connection sagMonitor.out -> voices[*].sagLevel;
+
+    // Chain routing
+    connection summer -> pultecEq.in;
+    connection pultecEq.out -> tapeSat.in;
+    connection tapeSat.out -> echo.in;
+    connection echo.out -> lp.in;
+    connection lp.out -> hp.in;
+
+    // Final
+    connection hp.out -> audioOut[0] [[ gain: masterGain ]];
+    connection hp.out -> audioOut[1] [[ gain: masterGain ]];
+
+    // Parameter links (broadcast to chain nodes where needed)
+    connection drive -> voices[*].drive;
+    connection tubeAge -> voices[*].driftAmount;
+    connection hornCutoff -> lp.frequency;  // reuse for bandwidth sim
+    connection wrnyMode -> echo.active;
+}
+
+// ... (keep your SimpleVoiceAllocator and FitchOscillator processors unchanged)
+
+// Approximate Pultec-style EQ (biquad shelves)
+processor PultecApproxEq
+{
+    input stream float in;
+    output stream float out;
+
+    input float lowBoost;
+    input float highBoost;
+
+    node lowShelf = std::filters::biquad::LowShelf (60.0f / processor.frequency, 0.707f);
+    node highShelf = std::filters::biquad::HighShelf (10000.0f / processor.frequency, 0.707f);
+
+    void main()
+    {
+        lowShelf.gain = lowBoost;
+        highShelf.gain = highBoost;
+
+        loop
+        {
+            float sig = in;
+            sig = lowShelf.process(sig);
+            sig = highShelf.process(sig);
+            out <- sig;
+            advance();
+        }
+    }
+}
+
+// Simple tape saturation approx (tanh + soft clip)
+processor TapeSatApprox
+{
+    input stream float in;
+    output stream float out;
+
+    void main()
+    {
+        loop
+        {
+            float sig = in;
+            sig = std::math::tanh(sig * 1.2f);  // basic tube/tape curve
+            sig = sig / (1.0f + std::math::abs(sig) * 0.3f);  // soft clip
+            out <- sig;
+            advance();
+        }
+    }
+}
+
+// Basic tape echo (short delay + feedback)
+processor SimpleTapeEcho
+{
+    input stream float in;
+    input bool active;
+    input float mix;
+    output stream float out;
+
+    let delaySamples = 22050;  // ~0.5s at 44.1kHz
+    float buffer[delaySamples];
+    int writePos = 0;
+
+    void main()
+    {
+        loop
+        {
+            float dry = in;
+            float wet = 0.0f;
+
+            if (active)
+            {
+                wet = buffer[writePos] * 0.4f;  // feedback ~40%
+                buffer[writePos] = dry + wet * 0.3f;  // add feedback
+                writePos = (writePos + 1) % delaySamples;
+            }
+
+            out <- dry * (1.0f - mix) + wet * mix;
+            advance();
+        }
+    }
+}
