@@ -1,0 +1,224 @@
+// Pianorad_Fitch_Edition.cmajor
+// 1926 Gernsback/Fitch Pianorad emulation – 25 independent LC tube oscillators
+// Pure sine core + tube drift/sag + mechanical filter + 1920s WRNY broadcast sim
+
+import std::oscillators;
+import std::math;
+import std::midi;
+import std::filters;
+import std::levels;
+import std::noise;
+
+graph Pianorad_Fitch_Edition [[main]]
+{
+    // === Exposed Parameters (GUI/Host) ===
+    input event midi::Message midiIn;
+
+    input float tubeAge      [[ name: "Tube Condition (Drift)", min: 0.0, max: 0.15, init: 0.03, group: "Hardware" ]];
+    input float voltageSag   [[ name: "B+ Voltage Sag (IMD)", min: 0.0, max: 0.6, init: 0.18, group: "Hardware" ]];
+    input float drive        [[ name: "Audion Saturation", min: 0.0, max: 2.5, init: 0.9, group: "Tone" ]];
+    input float hornCutoff   [[ name: "Horn Mechanical Filter Cutoff (Hz)", min: 800.0, max: 9000.0, init: 4200.0, group: "Tone" ]];
+    input bool  wrnyMode     [[ name: "WRNY 1926 Broadcast Sim", init: false, group: "Output" ]];
+    input float masterGain   [[ name: "Master Volume", min: 0.0, max: 2.0, init: 0.85 ]];
+
+    output stream float audioOut[2];
+
+    // === Polyphony: 25 voices max (historical hardware limit) ===
+    let maxVoices = 25;
+
+    // Simple round-robin voice allocator (no std::polyphony::VoiceManager in std lib)
+    node voiceAlloc = SimpleVoiceAllocator (maxVoices);
+
+    node voices = FitchOscillator[maxVoices];
+
+    // Sum of all voice outputs
+    node summer = std::math::Sum (float, maxVoices);
+
+    // Monitor total energy for shared voltage sag simulation
+    node sagMonitor = std::levels::RMS (0.08);  // short window for quick response to chords
+
+    // Output stage with optional WRNY radio emulation
+    node outputStage = WRNY_OutputStage;
+
+    // === Connections ===
+    connection midiIn -> voiceAlloc.midiIn;
+    connection voiceAlloc.voiceTriggers -> voices[*].noteTrigger;  // broadcast to all (processor handles active state)
+
+    connection voices[*].audioOut -> summer.inputs[*];
+
+    connection summer -> sagMonitor.in;
+
+    // Sag feeds back to all voices (shared B+ rail)
+    connection sagMonitor.out -> voices[*].sagLevel;
+
+    connection summer -> outputStage.in;
+    connection drive     -> voices[*].drive;
+    connection tubeAge   -> voices[*].driftAmount;
+    connection hornCutoff -> outputStage.hornCutoff;
+    connection wrnyMode  -> outputStage.wrnyActive;
+    connection masterGain -> outputStage.gain;
+
+    connection outputStage.out -> audioOut;
+}
+
+// ==========================================================================
+// Simple Voice Allocator (round-robin stealing for polyphony)
+// ==========================================================================
+processor SimpleVoiceAllocator
+{
+    input event midi::Message midiIn;
+    output event std::midi::NoteEvent voiceTriggers[maxVoices];
+
+    int32 nextVoice = 0;
+    int32 activeVoices[maxVoices];  // -1 = free, else note number
+
+    void main()
+    {
+        loop
+        {
+            let msg = midiIn.advance();
+
+            if (msg.isNoteOn || msg.isNoteOff)
+            {
+                let noteNum = msg.noteNumber;
+                let vel = msg.velocity;
+
+                if (msg.isNoteOn && vel > 0)
+                {
+                    // Steal oldest if full
+                    if (nextVoice >= maxVoices) nextVoice = 0;
+
+                    let ev = std::midi::NoteEvent { note: noteNum, velocity: vel, on: true };
+                    voiceTriggers[nextVoice] <- ev;
+                    activeVoices[nextVoice] = noteNum;
+                    nextVoice++;
+                }
+                else if (msg.isNoteOff || vel == 0)
+                {
+                    // Find and release matching voice
+                    loop (i, maxVoices)
+                    {
+                        if (activeVoices[i] == noteNum)
+                        {
+                            let ev = std::midi::NoteEvent { note: noteNum, velocity: 0, on: false };
+                            voiceTriggers[i] <- ev;
+                            activeVoices[i] = -1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            advance();
+        }
+    }
+}
+
+// ==========================================================================
+// THE FITCH OSCILLATOR – per-voice LC tube simulation
+// ==========================================================================
+processor FitchOscillator
+{
+    input event std::midi::NoteEvent noteTrigger;
+    input float drive;
+    input float driftAmount;
+    input float sagLevel;
+    output stream float audioOut;
+
+    float phase = 0.0f;
+    float currentFreq = 0.0f;
+    float driftPhase = 0.0f;
+
+    // 1926-ish component values (Honeycomb coil approx.)
+    let baseL = 0.0025f;  // 2.5 mH
+
+    void main()
+    {
+        loop
+        {
+            let ev = noteTrigger.advance();
+
+            if (ev.on && ev.velocity > 0)
+            {
+                currentFreq = std::midi::noteToFrequency (ev.note);
+            }
+            else if (!ev.on)
+            {
+                currentFreq = 0.0f;
+            }
+
+            if (currentFreq > 20.0f)  // avoid div-by-zero / sub-audio
+            {
+                // 1. Ideal C from target f = 1/(2π√(LC))
+                float idealC = 1.0f / (baseL * std::math::pow(currentFreq * 2.0f * std::math::pi<float>, 2));
+
+                // 2. Apply drift (slow sine wander) + sag (chord density lowers effective voltage → C change)
+                driftPhase += 0.00008f;
+                float modulatedC = idealC * (1.0f + std::math::sin(driftPhase) * driftAmount
+                                           + sagLevel * 0.015f);  // sag flattens pitch slightly
+
+                // 3. Recalculate actual oscillating frequency
+                float oscFreq = 1.0f / (2.0f * std::math::pi<float> * std::math::sqrt(baseL * modulatedC));
+
+                // Accumulate phase
+                phase += oscFreq / processor.frequency;
+                phase = std::math::frac(phase);
+
+                float sine = std::math::sin(phase * 2.0f * std::math::pi<float>);
+
+                // 4. Audion triode soft saturation (tanh approximates grid/plate curve)
+                float saturated = std::math::tanh(sine * (1.0f + drive * 1.5f));
+
+                // Amplitude sag (shared B+ drop reduces gain)
+                audioOut <- saturated * (1.0f - sagLevel * 0.25f);
+            }
+            else
+            {
+                audioOut <- 0.0f;
+            }
+
+            advance();
+        }
+    }
+}
+
+// ==========================================================================
+// WRNY 1926 Broadcast + Horn Speaker Output Stage
+// ==========================================================================
+processor WRNY_OutputStage
+{
+    input stream float in;
+    input float hornCutoff;
+    input bool wrnyActive;
+    input float gain;
+    output stream float out[2];
+
+    node lp = std::filters::tpt::LowPass();   // TPT-style, modulatable
+    node hp = std::filters::tpt::HighPass();  // horn low-end rolloff
+
+    void main()
+    {
+        hp.frequency = 180.0f;  // fixed horn cutoff
+
+        loop
+        {
+            lp.frequency = hornCutoff;  // "mechanical filter" via core damping sim
+
+            float sig = in * gain;
+
+            if (wrnyActive)
+            {
+                // Vintage radio artifacts: narrow bandwidth + crackle/hiss
+                float noise = std::noise::white() * 0.012f;
+                sig += noise;
+                sig = lp.process(sig);
+                sig = hp.process(sig);
+            }
+
+            out[0] <- sig;
+            out[1] <- sig;
+
+            advance();
+        }
+    }
+}
